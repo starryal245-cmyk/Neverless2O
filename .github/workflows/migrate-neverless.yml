@@ -17,10 +17,9 @@ jobs:
         run: |
           git clone --depth 1 --branch migration-backup-2026-10-20 https://github.com/daithegoatt-sketch/Neverlessbot.git /tmp/neverlessbot
           git clone --depth 1 --branch migration-backup-2026-10-20 https://github.com/daithegoatt-sketch/-NeverlessBank.git /tmp/neverlessbank
-          rsync -a --exclude='.git' /tmp/neverlessbot/ ./
+          rsync -a --exclude='.git' --exclude='.github/workflows/' /tmp/neverlessbot/ ./
           mkdir -p NeverlessBank
           rsync -a --exclude='.git' /tmp/neverlessbank/ ./NeverlessBank/
-          git rm .github/workflows/migrate-neverless.yml
       - name: Commit migration
         run: |
           git config user.name "github-actions[bot]"
