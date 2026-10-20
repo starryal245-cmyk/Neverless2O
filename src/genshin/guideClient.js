@@ -1,0 +1,205 @@
+'use strict';
+
+const { getGuideByText } = require('./guides');
+const { fetchGame8Guide } = require('./game8Client');
+const { fetchGame8TeamGroups, dedupeTeams } = require('./teamGroupClient');
+const { getBuildStatFallback } = require('./kqmClient');
+const { fetchGameWithStats } = require('./gameWithClient');
+const { applyDefaultBuildLogic } = require('./buildLogic');
+
+const CACHE_TTL = 12 * 60 * 60 * 1000;
+const cache = new Map();
+const nonEmpty = (value) => Array.isArray(value) && value.length > 0;
+
+const VERIFIED_ARTIFACT_ALTERNATIVES = {
+  columbina: ["4pc Silken Moon's Serenade", '4pc Aubade of Morningstar and Moon'],
+  ineffa: ["4pc Silken Moon's Serenade", '4pc Aubade of Morningstar and Moon'],
+};
+
+function normalizeName(value) {
+  return String(value || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '');
+}
+
+function addArtifactAlternatives(guide, name) {
+  if (!guide) return guide;
+  const extra = VERIFIED_ARTIFACT_ALTERNATIVES[normalizeName(name)] || [];
+  if (!extra.length) return guide;
+  const artifacts = [...(guide.artifacts || [])];
+  for (const candidate of extra) {
+    const key = normalizeName(String(candidate).replace(/^\s*[24]\s*(?:pc|piece)\s*/i, ''));
+    if (!artifacts.some((item) => {
+      const current = normalizeName(String(item).replace(/^\s*[24]\s*(?:pc|piece)\s*/i, ''));
+      return current === key;
+    })) artifacts.push(candidate);
+  }
+  return { ...guide, artifacts };
+}
+
+function normalizeTeams(value) {
+  if (!value) return { premium: [], f2p: [] };
+  if (Array.isArray(value)) return { premium: value, f2p: [] };
+  return { premium: Array.isArray(value.premium) ? value.premium : [], f2p: Array.isArray(value.f2p) ? value.f2p : [] };
+}
+
+function teamsFromGroups(groups) {
+  const premium = [];
+  const f2p = [];
+  for (const group of groups || []) {
+    const target = group.kind === 'f2p' ? f2p : premium;
+    target.push(...(group.teams || []));
+  }
+  return { premium: dedupeTeams(premium), f2p: dedupeTeams(f2p) };
+}
+
+function mergeGuide(live, curated) {
+  if (!live) return curated || null;
+  if (!curated) return live;
+  const lt = normalizeTeams(live.teams);
+  return {
+    ...curated, ...live,
+    role: live.role || curated.role,
+    stats: {
+      ...(curated.stats || {}), ...(live.stats || {}),
+      main: nonEmpty(live.stats?.main) ? live.stats.main : curated.stats?.main || [],
+      targets: nonEmpty(live.stats?.targets) ? live.stats.targets : curated.stats?.targets || [],
+      priority: live.stats?.priority || curated.stats?.priority || null,
+    },
+    weapons: nonEmpty(live.weapons) ? live.weapons : curated.weapons || [],
+    f2pWeapons: nonEmpty(live.f2pWeapons) ? live.f2pWeapons : curated.f2pWeapons || [],
+    artifacts: nonEmpty(live.artifacts) ? live.artifacts : curated.artifacts || [],
+    combos: nonEmpty(live.combos) ? live.combos : curated.combos || [],
+    teams: { premium: lt.premium, f2p: lt.f2p },
+    teamGroups: nonEmpty(live.teamGroups) ? live.teamGroups : [],
+  };
+}
+
+function validateSlotTeam(slots) {
+  if (!Array.isArray(slots) || slots.length !== 4) return null;
+  const clean = slots.map((slot) => Array.isArray(slot) ? [...new Set(slot.filter(Boolean))].slice(0, 8) : []);
+  return clean.every((slot) => slot.length) ? clean : null;
+}
+
+function validateRequirements(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out = {};
+  for (const [name, rule] of Object.entries(value)) {
+    const constellation = Number(rule?.constellation);
+    if (Number.isInteger(constellation) && constellation >= 0 && constellation <= 6) out[String(name).slice(0, 80)] = { constellation };
+  }
+  return out;
+}
+
+function validateGroups(groups) {
+  return (groups || []).map((group) => ({
+    kind: group?.kind === 'f2p' ? 'f2p' : 'premium',
+    category: String(group?.category || 'Team').slice(0, 120),
+    role: group?.role ? String(group.role).slice(0, 120) : '',
+    slotTeams: (group?.slotTeams || []).map(validateSlotTeam).filter(Boolean).slice(0, 12),
+    teams: dedupeTeams((group?.teams || []).filter((team) => Array.isArray(team) && team.length === 4)).slice(0, 40),
+    requirements: validateRequirements(group?.requirements),
+  })).filter((group) => group.slotTeams.length || group.teams.length).slice(0, 24);
+}
+
+function validateGuide(guide) {
+  if (!guide) return null;
+  const teams = normalizeTeams(guide.teams);
+  return {
+    ...guide,
+    stats: {
+      ...(guide.stats || {}),
+      main: (guide.stats?.main || []).filter(Boolean).slice(0, 8),
+      targets: (guide.stats?.targets || []).filter(Boolean).slice(0, 8),
+      priority: guide.stats?.priority || null,
+    },
+    weapons: (guide.weapons || []).filter(Boolean).slice(0, 10),
+    f2pWeapons: (guide.f2pWeapons || []).filter(Boolean).slice(0, 6),
+    artifacts: (guide.artifacts || []).filter(Boolean).slice(0, 6),
+    combos: (guide.combos || []).filter(Boolean).slice(0, 8),
+    teams: {
+      premium: dedupeTeams(teams.premium.filter((team) => Array.isArray(team) && team.length === 4)).slice(0, 60),
+      f2p: dedupeTeams(teams.f2p.filter((team) => Array.isArray(team) && team.length === 4)).slice(0, 40),
+    },
+    teamGroups: validateGroups(guide.teamGroups),
+  };
+}
+
+async function getGuide(name) {
+  const key = String(name || '').toLowerCase();
+  const cached = cache.get(key);
+  if (cached?.expiresAt > Date.now()) return cached.value;
+
+  const curated = getGuideByText(name);
+  let live = null;
+  let groups = [];
+
+  try {
+    [live, groups] = await Promise.all([
+      fetchGame8Guide(name).catch((error) => {
+        console.warn(`[genshin] Game8 guide unavailable for ${name}: ${error.message}`);
+        return null;
+      }),
+      fetchGame8TeamGroups(name).catch((error) => {
+        console.warn(`[genshin] Game8 team groups unavailable for ${name}: ${error.message}`);
+        return [];
+      }),
+    ]);
+  } catch (error) {
+    console.warn(`[genshin] Game8 lookup unavailable for ${name}: ${error.message}`);
+  }
+
+  if (groups.length) {
+    const groupedTeams = teamsFromGroups(groups);
+    live = {
+      ...(live || { name, source: 'Game8' }),
+      teams: groupedTeams,
+      teamGroups: groups,
+    };
+  }
+
+  let value = validateGuide(addArtifactAlternatives(mergeGuide(live, curated), name));
+  const needTargets = !nonEmpty(value?.stats?.targets);
+  const needPriority = !value?.stats?.priority;
+
+  if (needTargets || needPriority) {
+    const [secondary, theory] = await Promise.all([
+      fetchGameWithStats(name).catch((error) => {
+        console.warn(`[genshin] Secondary stat goals unavailable for ${name}: ${error.message}`);
+        return null;
+      }),
+      needPriority ? getBuildStatFallback(name).catch((error) => {
+        console.warn(`[genshin] Secondary stat priority unavailable for ${name}: ${error.message}`);
+        return null;
+      }) : Promise.resolve(null),
+    ]);
+
+    if (!value && (secondary?.targets?.length || secondary?.priority || theory?.priority)) {
+      value = validateGuide(addArtifactAlternatives({ name, stats: { main: [], targets: [], priority: null } }, name));
+    }
+
+    if (value) {
+      const stats = { ...(value.stats || {}) };
+      if (needTargets && secondary?.targets?.length) {
+        stats.targets = secondary.targets;
+        stats.targetFallback = true;
+      }
+      if (needPriority) stats.priority = theory?.priority || secondary?.priority || stats.priority || null;
+      value = validateGuide(addArtifactAlternatives({ ...value, stats }, name));
+    }
+  }
+
+  // Apply verified build-shape corrections only after all external sources merge.
+  // This touches stats/main-stat guidance only; teams, weapons and other systems stay intact.
+  value = validateGuide(applyDefaultBuildLogic(value));
+
+  cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL });
+  return value;
+}
+
+module.exports = {
+  getGuide,
+  mergeGuide,
+  normalizeTeams,
+  teamsFromGroups,
+  validateGroups,
+  addArtifactAlternatives,
+};

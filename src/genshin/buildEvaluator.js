@@ -1,0 +1,272 @@
+'use strict';
+
+const { LABELS, parseTarget, guideProfile, formatTarget } = require('./statProfile');
+const { reviewArtifacts } = require('./artifactEvaluator');
+const { effectiveStatsForRating } = require('./combatStats');
+
+function normalize(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function clamp(value, min = 0, max = 1) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function akashaPercent(value) {
+  if (Number.isFinite(value)) return value > 0 && value <= 100 ? value : null;
+  const nested = Number(value?.topPercent ?? value?.top_percent);
+  return Number.isFinite(nested) && nested > 0 && nested <= 100 ? nested : null;
+}
+
+function targetScore(value, target) {
+  if (!Number.isFinite(value) || !target) return 0;
+  if (value >= target.min && (target.max === target.min || value <= target.max)) return 1;
+  if (value < target.min) {
+    const ratio = Math.max(0, value / Math.max(1, target.min));
+    return ratio * ratio;
+  }
+  if (target.key === 'er') return Math.max(0.55, target.max / value);
+  return 1;
+}
+
+function cleanSetName(value) {
+  return normalize(String(value || '').replace(/^\s*[24]\s*(?:pc|piece)\s*/i, ''));
+}
+
+function artifactCompletion(snapshot) {
+  const artifacts = Array.isArray(snapshot?.artifacts) ? snapshot.artifacts : [];
+  if (!artifacts.length) return { score: 0, count: 0, avgLevel: 0 };
+  const count = Math.min(5, artifacts.length);
+  const levels = artifacts.map((item) => Number.isFinite(item.level) ? Math.max(0, Math.min(20, item.level)) : 0);
+  const avgLevel = levels.reduce((a, b) => a + b, 0) / Math.max(1, artifacts.length);
+  const countScore = count / 5;
+  const levelScore = levels.reduce((sum, level) => sum + (level / 20), 0) / 5;
+  return { score: countScore * 0.35 + levelScore * 0.65, count, avgLevel };
+}
+
+function recommendedSetMatch(snapshot, guide) {
+  const current = Object.entries(snapshot?.setCounts || {}).sort((a, b) => b[1] - a[1]);
+  if (!current.length) return 0;
+  const recommendations = (guide?.artifacts || []).map(cleanSetName).filter(Boolean);
+  if (!recommendations.length) return 0.7;
+
+  for (const [setName, count] of current) {
+    const currentName = cleanSetName(setName);
+    if (!currentName) continue;
+    const matches = recommendations.some((recommended) => recommended.includes(currentName) || currentName.includes(recommended));
+    if (matches && count >= 4) return 1;
+    if (matches && count >= 2) return 0.65;
+  }
+  return 0.2;
+}
+
+function mainStatMatch(snapshot, guide) {
+  const expected = guide?.stats?.main || [];
+  if (!expected.length) return 0.65;
+  const slots = ['sands', 'goblet', 'circlet'];
+  let total = 0;
+  let matched = 0;
+
+  for (const slot of slots) {
+    const target = expected.find((item) => String(item).toLowerCase().startsWith(`${slot}:`));
+    if (!target) continue;
+    total += 1;
+    const actual = snapshot?.artifacts?.find((item) => item.slot === slot);
+    if (!actual) continue;
+    const actualKey = normalize(actual.mainStat);
+    const options = target.split(':').slice(1).join(':').split(/\/|>|\bor\b/i).map(normalize).filter(Boolean);
+    if (options.some((option) => option && (actualKey.includes(option) || option.includes(actualKey)))) matched += 1;
+  }
+  return total ? matched / total : 0.65;
+}
+
+function unlistedWeaponBaseline(snapshot) {
+  const rarity = Number(snapshot?.weapon?.rarity);
+  const level = Number(snapshot?.weapon?.level);
+  const rarityBase = rarity >= 5 ? 0.70 : rarity === 4 ? 0.62 : rarity === 3 ? 0.52 : 0.56;
+  const levelFactor = Number.isFinite(level) ? clamp(level / 90, 0.5, 1) : 0.9;
+  return rarityBase * (0.85 + levelFactor * 0.15);
+}
+
+function weaponMatch(snapshot, guide) {
+  const name = normalize(snapshot?.weapon?.name);
+  if (!name) return 0;
+  const weapons = [...new Set([...(guide?.weapons || []), ...(guide?.f2pWeapons || [])])];
+  if (!weapons.length) return unlistedWeaponBaseline(snapshot);
+  const index = weapons.findIndex((item) => {
+    const recommended = normalize(item);
+    return recommended && (recommended.includes(name) || name.includes(recommended));
+  });
+  // A weapon missing from a scraped recommendation list is unknown, not automatically bad.
+  // Keep a meaningful gap from a documented recommendation while avoiding a flat 50% penalty.
+  if (index < 0) return unlistedWeaponBaseline(snapshot);
+  return [1, 0.93, 0.88, 0.84, 0.8, 0.76][Math.min(index, 5)];
+}
+
+function akashaScore(value) {
+  const percentile = akashaPercent(value);
+  if (!Number.isFinite(percentile)) return 0.5;
+  if (percentile <= 1) return 1;
+  if (percentile <= 2) return 0.98;
+  if (percentile <= 5) return 0.95;
+  if (percentile <= 10) return 0.9;
+  if (percentile <= 20) return 0.82;
+  if (percentile <= 35) return 0.72;
+  if (percentile <= 50) return 0.6;
+  if (percentile <= 75) return 0.44;
+  return 0.28;
+}
+
+function statWeight(key, profile) {
+  const priorityIndex = profile.priority.indexOf(key);
+  const priorityBonus = priorityIndex < 0 ? 0 : Math.max(0, 0.35 - priorityIndex * 0.06);
+  const base = ['critRate', 'critDmg'].includes(key) ? 1.15 : ['atk', 'hp', 'def'].includes(key) ? 1.1 : 1;
+  return base + priorityBonus;
+}
+
+function usefulRvScore(averageUsefulRv) {
+  const rv = Number(averageUsefulRv);
+  if (!Number.isFinite(rv) || rv <= 0) return 0.3;
+  const points = [
+    [0, 0.3],
+    [250, 0.42],
+    [330, 0.56],
+    [450, 0.76],
+    [550, 0.9],
+    [650, 1],
+  ];
+  for (let index = 1; index < points.length; index += 1) {
+    const [x1, y1] = points[index - 1];
+    const [x2, y2] = points[index];
+    if (rv <= x2) {
+      const t = clamp((rv - x1) / Math.max(1, x2 - x1));
+      return y1 + (y2 - y1) * t;
+    }
+  }
+  return 1;
+}
+
+function critReadinessScore(stats, profile) {
+  const wantsCrit = profile.priority.includes('critRate')
+    || profile.priority.includes('critDmg')
+    || profile.ordered.includes('critRate')
+    || profile.ordered.includes('critDmg');
+  if (!wantsCrit) return null;
+  const cr = Number(stats?.critRate);
+  const cd = Number(stats?.critDmg);
+  if (!Number.isFinite(cr) || !Number.isFinite(cd)) return null;
+
+  const crScore = clamp((cr - 30) / 40);
+  const cdScore = clamp((cd - 100) / 100);
+  return crScore * 0.45 + cdScore * 0.55;
+}
+
+function fallbackStatScore(snapshot, guide, profile, effectiveStats) {
+  const report = reviewArtifacts(snapshot, guide);
+  const rv = usefulRvScore(report.averageUsefulRv);
+  const crit = critReadinessScore(effectiveStats, profile);
+  if (Number.isFinite(crit)) return clamp(rv * 0.7 + crit * 0.3);
+  return clamp(rv);
+}
+
+function evaluateBuild(snapshot, guide, options = {}) {
+  const profile = guideProfile(guide);
+  const completion = artifactCompletion(snapshot);
+  const setScore = recommendedSetMatch(snapshot, guide);
+  const mainsScore = mainStatMatch(snapshot, guide);
+  const weaponScore = weaponMatch(snapshot, guide);
+  const combat = effectiveStatsForRating(snapshot, guide, { weaponData: options.weaponData || null });
+  const notes = [];
+  const relevantStats = [];
+
+  let statWeightTotal = 0;
+  let statPoints = 0;
+  for (const key of profile.ordered) {
+    const target = profile.targetMap[key];
+    const rawValue = snapshot?.stats?.[key];
+    const effectiveValue = combat.effective?.[key];
+    if (!target || !Number.isFinite(effectiveValue)) continue;
+    const ratio = targetScore(effectiveValue, target);
+    const weight = statWeight(key, profile);
+    statWeightTotal += weight;
+    statPoints += weight * ratio;
+    const status = effectiveValue < target.min ? 'down' : (key === 'er' && effectiveValue > target.max * 1.12 ? 'warn' : 'ok');
+    const suffix = ['critRate', 'critDmg', 'er'].includes(key) ? '%' : '';
+    const shownValue = Math.round(effectiveValue * 10) / 10;
+    if (status === 'down') notes.push({ type: 'down', key, text: `${LABELS[key]} ${shownValue}${suffix} < ${target.min}${suffix}` });
+    else if (status === 'warn') notes.push({ type: 'warn', key, text: `${LABELS[key]} ${shownValue}% أعلى من الهدف ${formatTarget(target)}` });
+    relevantStats.push({ key, label: LABELS[key], value: rawValue, effectiveValue, combatBonus: Number(combat.bonuses?.[key]) || 0, target, ratio, status, weight });
+  }
+
+  const explicitStatScore = statWeightTotal ? statPoints / statWeightTotal : null;
+  const fallback = fallbackStatScore(snapshot, guide, profile, combat.effective);
+  let statScore;
+  const targetCount = relevantStats.length;
+  if (!targetCount) statScore = fallback;
+  else if (targetCount === 1) statScore = explicitStatScore * 0.45 + fallback * 0.55;
+  else if (targetCount === 2) statScore = explicitStatScore * 0.75 + fallback * 0.25;
+  else statScore = explicitStatScore;
+
+  const percentile = akashaPercent(options.akashaPercentile);
+  const akasha = akashaScore(options.akashaPercentile);
+  const hasAkasha = Number.isFinite(percentile);
+
+  let raw;
+  if (hasAkasha) {
+    raw = statScore * 0.35 + completion.score * 0.15 + mainsScore * 0.10 + setScore * 0.10 + weaponScore * 0.10 + akasha * 0.20;
+  } else {
+    raw = statScore * 0.42 + completion.score * 0.20 + mainsScore * 0.15 + setScore * 0.10 + weaponScore * 0.13;
+  }
+
+  let score = Math.round(Math.max(0, Math.min(1, raw)) * 100);
+  const eliteAkasha = hasAkasha && percentile <= 10;
+
+  if (completion.count === 0) score = Math.min(score, 25);
+  else if (completion.count < 3) score = Math.min(score, 42);
+  else if (completion.count < 5) score = Math.min(score, 62);
+  if (completion.count === 5 && completion.avgLevel < 12) score = Math.min(score, 68);
+  else if (completion.count === 5 && completion.avgLevel < 18) score = Math.min(score, 82);
+
+  if (mainsScore < 0.34) score = Math.min(score, eliteAkasha ? 78 : 62);
+  else if (mainsScore < 0.67) score = Math.min(score, eliteAkasha ? 92 : 80);
+  if (setScore < 0.5 && guide?.artifacts?.length) score = Math.min(score, eliteAkasha ? 92 : 86);
+  if (!snapshot?.weapon?.name) score = Math.min(score, 68);
+
+  if (completion.count < 5) notes.unshift({ type: 'down', key: 'artifacts', text: `Artifacts ${completion.count}/5` });
+  else if (completion.avgLevel < 20) notes.unshift({ type: 'warn', key: 'artifacts', text: `متوسط مستوى الآرتيفاكت +${Math.round(completion.avgLevel)}/20` });
+  if (mainsScore < 1) notes.push({ type: mainsScore < 0.34 ? 'down' : 'warn', key: 'mainStats', text: `Main Stats ${Math.round(mainsScore * 100)}% مطابقة` });
+  if (setScore < 1 && guide?.artifacts?.length) notes.push({ type: 'warn', key: 'set', text: `Artifact set match ${Math.round(setScore * 100)}%` });
+
+  return {
+    score,
+    statScore: Math.round(statScore * 100),
+    statTargetCount: targetCount,
+    fallbackStatScore: Math.round(fallback * 100),
+    artifactCompletionScore: Math.round(completion.score * 100),
+    mainStatScore: Math.round(mainsScore * 100),
+    artifactSetScore: Math.round(setScore * 100),
+    weaponScore: Math.round(weaponScore * 100),
+    akashaComponent: Math.round(akasha * 100),
+    akashaPercentile: percentile,
+    artifactCount: completion.count,
+    artifactAvgLevel: Math.round(completion.avgLevel * 10) / 10,
+    combatBonuses: combat.bonuses,
+    combatBonusSources: combat.sources || [],
+    relevantStats,
+    notes,
+  };
+}
+
+function compareSnapshots(previous, current) {
+  if (!previous) return null;
+  const fields = ['hp', 'atk', 'def', 'critRate', 'critDmg', 'er', 'em'];
+  const deltas = {};
+  for (const key of fields) {
+    const before = previous.snapshot?.stats?.[key];
+    const after = current.snapshot?.stats?.[key];
+    if (Number.isFinite(before) && Number.isFinite(after)) deltas[key] = Math.round((after - before) * 10) / 10;
+  }
+  return { scoreDelta: current.evaluation.score - previous.evaluation.score, deltas, previousScore: previous.evaluation.score, currentScore: current.evaluation.score };
+}
+
+module.exports = { evaluateBuild, compareSnapshots, parseTarget, LABELS, akashaPercent, targetScore, usefulRvScore, fallbackStatScore, weaponMatch, unlistedWeaponBaseline };
