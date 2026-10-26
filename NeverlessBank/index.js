@@ -4,7 +4,10 @@ const http = require('node:http');
 const { Client, GatewayIntentBits } = require('discord.js');
 const { installBankSystem } = require('./src/bankSystem');
 
-if (!process.env.DISCORD_TOKEN) {
+const discordToken = String(process.env.DISCORD_TOKEN || '')
+  .replace(/[\s\u200B-\u200D\uFEFF]+/g, '');
+
+if (!discordToken) {
   console.error('Missing DISCORD_TOKEN environment variable.');
   process.exit(1);
 }
@@ -35,4 +38,4 @@ http.createServer((req, res) => {
   }));
 }).listen(port, '0.0.0.0', () => console.log(`[bank] health server listening on ${port}`));
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(discordToken);
